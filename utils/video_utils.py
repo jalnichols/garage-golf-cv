@@ -6,9 +6,10 @@ import numpy as np
 import os
 from datetime import datetime
 
-def create_video_writer(filename, width, height, fps, fourcc='mp4v'):
-    """Create a video writer with specified parameters"""
+def create_video_writer(filename, width, height, fps, fourcc='XVID'):
+    """Create a video writer with specified parameters (video-only, no audio)"""
     fourcc_code = cv2.VideoWriter_fourcc(*fourcc)
+    # OpenCV VideoWriter only handles video streams, no audio recording
     return cv2.VideoWriter(filename, fourcc_code, fps, (width, height))
 
 def merge_videos_side_by_side(video_paths, output_path):
@@ -24,8 +25,8 @@ def merge_videos_side_by_side(video_paths, output_path):
     height = int(caps[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = caps[0].get(cv2.CAP_PROP_FPS)
     
-    # Create output video writer (3x width for side-by-side)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Create output video writer (3x width for side-by-side, video-only)
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width * 3, height))
     
     while True:

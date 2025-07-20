@@ -62,6 +62,10 @@ class VoiceControlledRecorder:
         self.recording_thread = None
         self.running = False
         
+        # Multithreaded frame capture
+        self.capture_threads = []
+        self.frame_queues = [queue.Queue(maxsize=100) for _ in range(CAMERA_COUNT)]
+        
     def initialize(self):
         """Initialize cameras, calibration, and voice recognition"""
         print("Initializing cameras...")
@@ -102,6 +106,21 @@ class VoiceControlledRecorder:
             print(f"Voice recognition setup failed: {e}")
             print("Continuing without voice control (use keyboard instead)")
             return True
+    
+    def capture_loop(self, cam_index):
+        """Continuous frame capture loop for a specific camera"""
+        cam = self.cameras[cam_index]
+        while self.running:
+            ret, frame = cam.read()
+            if not ret:
+                continue
+            if self.use_calibration and cam_index < len(self.calibration_data):
+                mtx, dist = self.calibration_data[cam_index]
+                frame = undistort_frame(frame, mtx, dist)
+            try:
+                self.frame_queues[cam_index].put_nowait((frame, datetime.now()))
+            except queue.Full:
+                pass
     
     def listen_for_commands(self):
         """Voice recognition thread function"""
@@ -264,23 +283,34 @@ class VoiceControlledRecorder:
         self.voice_thread = threading.Thread(target=self.listen_for_commands, daemon=True)
         self.voice_thread.start()
         
+        # Start capture threads
+        for i in range(len(self.cameras)):
+            t = threading.Thread(target=self.capture_loop, args=(i,), daemon=True)
+            self.capture_threads.append(t)
+            t.start()
+        
         frame_count = 0
         fps_start = time.time()
         
         try:
             while self.running:
-                # Capture frames
-                frames, timestamps = capture_synchronized_frames(self.cameras)
+                # Capture frames from queues
+                frames = []
+                timestamps = []
+                for i in range(len(self.cameras)):
+                    try:
+                        frame, ts = self.frame_queues[i].get_nowait()
+                    except queue.Empty:
+                        frame, ts = None, None
+                    frames.append(frame)
+                    timestamps.append(ts)
                 
                 # Process frames
                 display_frames = []
                 for i, frame in enumerate(frames):
                     if frame is not None:
-                        # Apply calibration if available
+                        # Frame is already calibrated in capture_loop
                         processed_frame = frame.copy()
-                        if self.use_calibration and i < len(self.calibration_data):
-                            mtx, dist = self.calibration_data[i]
-                            processed_frame = undistort_frame(processed_frame, mtx, dist)
                         
                         # Add to buffer
                         self.frame_buffers[i].append(processed_frame.copy())
@@ -373,6 +403,11 @@ class VoiceControlledRecorder:
         # Wait for threads to finish
         if self.voice_thread and self.voice_thread.is_alive():
             self.voice_thread.join(timeout=2)
+        
+        # Join capture threads
+        for t in self.capture_threads:
+            if t.is_alive():
+                t.join(timeout=1)
         
         # Release cameras and close windows
         cv2.destroyAllWindows()

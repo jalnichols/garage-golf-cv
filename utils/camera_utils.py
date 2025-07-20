@@ -11,15 +11,20 @@ def initialize_cameras(width=1920, height=1080, fps=60):
     cameras = []
     
     for i in range(CAMERA_COUNT):
-        cap = cv2.VideoCapture(i)
+        # Use DirectShow backend for Windows
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         if not cap.isOpened():
             print(f"Warning: Camera {i} could not be opened")
             continue
             
-        # Set camera properties
+        # Set camera properties with optimizations
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         cap.set(cv2.CAP_PROP_FPS, fps)
+        # Force MJPEG format
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # Minimize latency with buffer size
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         # Verify settings
         actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
