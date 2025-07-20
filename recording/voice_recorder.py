@@ -350,7 +350,10 @@ class VoiceControlledRecorder:
                     cv2.putText(combined, status, (10, combined.shape[0] - 10), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                     
-                    cv2.imshow('Golf Swing Recorder', combined)
+                    if not self.is_recording:
+                       cv2.imshow('Golf Swing Recorder', combined)
+                    else:
+                       cv2.destroyWindow('Golf Swing Recorder')
                 
                 # Process voice commands
                 try:
