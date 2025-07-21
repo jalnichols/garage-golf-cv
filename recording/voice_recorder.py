@@ -2,6 +2,7 @@
 """
 Voice-controlled recording system for golf swing analysis
 Listens for voice commands to start/stop synchronized recording from all cameras
+FIXED VERSION - addresses GUI flickering and FPS issues
 """
 
 import cv2
@@ -62,37 +63,112 @@ class VoiceControlledRecorder:
         self.recording_thread = None
         self.running = False
         
-        # Multithreaded frame capture
+        # GUI state tracking
+        self.window_visible = False
+        self.was_recording = False
+        
+        # Improved frame capture with rate limiting
         self.capture_threads = []
-        self.frame_queues = [queue.Queue(maxsize=100) for _ in range(CAMERA_COUNT)]
+        self.frame_queues = []  # Will be initialized based on actual camera count
+        self.last_frame_time = []
+        self.target_capture_fps = 60  # Limit capture FPS to match camera max
+        
+        # Main loop timing
+        self.target_main_fps = 60
+        self.frame_interval = 1.0 / self.target_main_fps
+        
+    def filter_c922_cameras(self, all_cameras):
+        """Filter cameras to only include c922s, excluding internal webcams"""
+        filtered_cameras = []
+        
+        print("Filtering cameras to exclude internal webcam...")
+        
+        for i, cam in enumerate(all_cameras):
+            if cam is None:
+                continue
+                
+            # Get camera properties
+            width = cam.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = cam.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            fps = cam.get(cv2.CAP_PROP_FPS)
+            
+            print(f"  Camera {i}: {width}x{height} @ {fps}fps")
+            
+            # c922 typically supports these combinations:
+            # - 1920x1080 @ 30fps (some setups might show 60fps)
+            # - 1280x720 @ 60fps
+            # - Lower resolutions at 60fps
+            
+            # Filter criteria for c922 (exclude typical internal webcam resolutions)
+            is_c922 = False
+            
+            # Check for common c922 resolution/fps combinations
+            if (width >= 1280 and height >= 720):  # c922 supports HD and above
+                if (width == 1920 and height == 1080):  # Full HD
+                    is_c922 = True
+                    print(f"    → Detected as c922 (Full HD capable)")
+                elif (width == 1280 and height == 720):  # HD
+                    is_c922 = True  
+                    print(f"    → Detected as c922 (HD capable)")
+                else:
+                    print(f"    → Unknown high-res camera (including)")
+                    is_c922 = True
+            else:
+                print(f"    → Likely internal webcam (excluding)")
+            
+            # Additional check: exclude cameras that can't do at least 720p
+            if width < 1280 or height < 720:
+                print(f"    → Resolution too low for c922 (excluding)")
+                is_c922 = False
+            
+            if is_c922:
+                filtered_cameras.append(cam)
+                print(f"    ✅ Camera {i} included")
+            else:
+                print(f"    ❌ Camera {i} excluded")
+                cam.release()  # Release excluded cameras
+        
+        return filtered_cameras
         
     def initialize(self):
         """Initialize cameras, calibration, and voice recognition"""
         print("Initializing cameras...")
         
-        # Initialize cameras
-        self.cameras = initialize_cameras(RECORDING_WIDTH, RECORDING_HEIGHT, RECORDING_FPS)
+        # Initialize all cameras first
+        all_cameras = initialize_cameras(RECORDING_WIDTH, RECORDING_HEIGHT, RECORDING_FPS)
         
-        if len(self.cameras) == 0:
+        if len(all_cameras) == 0:
             print("No cameras detected!")
             return False
         
-        print(f"Initialized {len(self.cameras)} cameras")
+        # Filter cameras to only include c922s (exclude internal webcam)
+        self.cameras = self.filter_c922_cameras(all_cameras)
+        
+        if len(self.cameras) == 0:
+            print("No c922 cameras detected! Check camera connections.")
+            return False
+        
+        print(f"Initialized {len(self.cameras)} c922 cameras")
+        
+        # Initialize queues and timing arrays based on actual camera count
+        self.frame_queues = [queue.Queue(maxsize=10) for _ in range(len(self.cameras))]
+        self.last_frame_time = [0] * len(self.cameras)
         
         # Initialize frame buffers
         for i in range(len(self.cameras)):
             self.frame_buffers.append(deque(maxlen=self.buffer_size))
         
-        # Load calibration data
+        # Load calibration data for filtered cameras
         if self.use_calibration:
-            print("Loading calibration data...")
+            print("Loading calibration data for c922 cameras...")
             for i in range(len(self.cameras)):
+                # Note: calibration files should be numbered based on camera order
                 mtx, dist = load_camera_calibration(i, CALIBRATION_DATA_PATH)
                 self.calibration_data.append((mtx, dist))
                 if mtx is not None:
-                    print(f"  Camera {i}: Calibration loaded")
+                    print(f"  c922 Camera {i}: Calibration loaded")
                 else:
-                    print(f"  Camera {i}: No calibration data")
+                    print(f"  c922 Camera {i}: No calibration data")
         
         # Initialize voice recognition
         print("Initializing voice recognition...")
@@ -108,18 +184,36 @@ class VoiceControlledRecorder:
             return True
     
     def capture_loop(self, cam_index):
-        """Continuous frame capture loop for a specific camera"""
+        """Continuous frame capture loop for a specific camera with rate limiting"""
         cam = self.cameras[cam_index]
+        frame_interval = 1.0 / self.target_capture_fps
+        
         while self.running:
+            current_time = time.time()
+            
+            # Rate limiting
+            if current_time - self.last_frame_time[cam_index] < frame_interval:
+                time.sleep(0.001)  # Small sleep to prevent busy waiting
+                continue
+                
             ret, frame = cam.read()
             if not ret:
+                time.sleep(0.01)  # Sleep on failed read
                 continue
+                
+            self.last_frame_time[cam_index] = current_time
+            
+            # Apply calibration if available
             if self.use_calibration and cam_index < len(self.calibration_data):
                 mtx, dist = self.calibration_data[cam_index]
-                frame = undistort_frame(frame, mtx, dist)
+                if mtx is not None:
+                    frame = undistort_frame(frame, mtx, dist)
+            
             try:
+                # Only add to queue if not full (non-blocking)
                 self.frame_queues[cam_index].put_nowait((frame, datetime.now()))
             except queue.Full:
+                # Drop frame if queue is full
                 pass
     
     def listen_for_commands(self):
@@ -172,7 +266,8 @@ class VoiceControlledRecorder:
             print("Already recording!")
             return
         
-        print("Starting recording...")
+        print("Starting recording with c922 cameras...")
+        print("*** GUI HIDDEN DURING RECORDING ***")
         self.is_recording = True
         self.recording_started = True
         self.stop_recording_flag = False
@@ -185,11 +280,11 @@ class VoiceControlledRecorder:
         # Create video writers
         self.video_writers = []
         for i in range(len(self.cameras)):
-            filename = os.path.join(OUTPUT_VIDEOS_PATH, f"camera_{i}_{timestamp}.mp4")
+            filename = os.path.join(OUTPUT_VIDEOS_PATH, f"c922_{i}_{timestamp}.mp4")
             writer = create_video_writer(filename, RECORDING_WIDTH, RECORDING_HEIGHT, RECORDING_FPS)
             self.video_writers.append(writer)
             self.current_recording_files.append(filename)
-            print(f"  Camera {i}: {filename}")
+            print(f"  c922 Camera {i}: {filename}")
         
         # Write buffered frames (pre-swing)
         print(f"Writing {len(self.frame_buffers[0])} buffered frames...")
@@ -223,10 +318,11 @@ class VoiceControlledRecorder:
                     # Apply calibration if available
                     if self.use_calibration and i < len(self.calibration_data):
                         mtx, dist = self.calibration_data[i]
-                        frame = undistort_frame(frame, mtx, dist)
+                        if mtx is not None:
+                            frame = undistort_frame(frame, mtx, dist)
                     
                     # Add timestamp
-                    timestamp_text = f"Camera {i} - {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
+                    timestamp_text = f"c922-{i} - {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
                     frame = add_timestamp_to_frame(frame, timestamp_text)
                     
                     self.video_writers[i].write(frame)
@@ -243,15 +339,16 @@ class VoiceControlledRecorder:
         
         recording_duration = time.time() - self.recording_start_time
         print(f"Recording complete! Duration: {recording_duration:.2f} seconds")
+        print("*** GUI WILL REAPPEAR ***")
         
         # Merge videos
         if len(self.current_recording_files) >= 2:
-            print("Merging videos...")
+            print("Merging c922 videos...")
             merged_filename = os.path.join(OUTPUT_VIDEOS_PATH, 
-                                         generate_output_filename("golf_swing_merged"))
+                                         generate_output_filename("c922_golf_swing_merged"))
             try:
                 merge_videos_side_by_side(self.current_recording_files, merged_filename)
-                print(f"Merged video saved: {merged_filename}")
+                print(f"Merged c922 video saved: {merged_filename}")
             except Exception as e:
                 print(f"Video merging failed: {e}")
         
@@ -259,7 +356,7 @@ class VoiceControlledRecorder:
         self.current_recording_files = []
     
     def run(self):
-        """Main recording loop"""
+        """Main recording loop with proper timing control"""
         if not self.initialize():
             return
         
@@ -277,6 +374,7 @@ class VoiceControlledRecorder:
         print()
         
         self.running = True
+        self.was_recording = False  # Initialize recording state tracking
         
         # Start voice recognition thread
         self.listening = True
@@ -291,69 +389,93 @@ class VoiceControlledRecorder:
         
         frame_count = 0
         fps_start = time.time()
+        last_fps_log = time.time()  # Track when we last logged FPS
+        fps_log_interval = 15.0  # Log FPS every 15 seconds
+        last_loop_time = time.time()
         
         try:
             while self.running:
-                # Capture frames from queues
+                loop_start_time = time.time()
+                
+                # Get latest frames from queues (with timeout to prevent blocking)
                 frames = []
                 timestamps = []
                 for i in range(len(self.cameras)):
                     try:
-                        frame, ts = self.frame_queues[i].get_nowait()
-                    except queue.Empty:
+                        # Try to get the most recent frame, discarding older ones
                         frame, ts = None, None
+                        while True:
+                            try:
+                                frame, ts = self.frame_queues[i].get_nowait()
+                            except queue.Empty:
+                                break
+                        if frame is None:
+                            # If no frame available, try once more with short timeout
+                            try:
+                                frame, ts = self.frame_queues[i].get(timeout=0.001)
+                            except queue.Empty:
+                                pass
+                    except:
+                        frame, ts = None, None
+                    
                     frames.append(frame)
                     timestamps.append(ts)
                 
-                # Process frames
-                display_frames = []
-                for i, frame in enumerate(frames):
-                    if frame is not None:
-                        # Frame is already calibrated in capture_loop
-                        processed_frame = frame.copy()
-                        
-                        # Add to buffer
-                        self.frame_buffers[i].append(processed_frame.copy())
-                        
-                        # If recording, write to file
-                        if self.is_recording and not self.stop_recording_flag:
-                            if i < len(self.video_writers) and self.video_writers[i] is not None:
-                                # Add timestamp to recorded frame
-                                timestamp_text = f"Camera {i} - {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
-                                recorded_frame = add_timestamp_to_frame(processed_frame.copy(), timestamp_text)
-                                self.video_writers[i].write(recorded_frame)
-                        
-                        # Create display frame (smaller)
-                        display_frame = cv2.resize(processed_frame, (320, 240))
-                        
-                        # Add recording indicator
-                        if self.is_recording:
-                            cv2.circle(display_frame, (300, 20), 8, (0, 0, 255), -1)
-                            cv2.putText(display_frame, "REC", (270, 25), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                        
-                        cv2.putText(display_frame, f"Cam {i}", (10, 20), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        
-                        display_frames.append(display_frame)
+                # Handle GUI state changes (recording start/stop)
+                if self.is_recording != self.was_recording:
+                    if self.is_recording:
+                        # Just started recording - hide the GUI
+                        cv2.destroyWindow('Golf Swing Recorder')
+                        self.window_visible = False
+                        print("GUI hidden during recording")
+                    else:
+                        # Just stopped recording - will show GUI again below
+                        self.window_visible = False  # Reset to recreate window
+                        print("GUI will be shown again")
+                    self.was_recording = self.is_recording
                 
-                # Show combined display
-                if display_frames:
-                    if len(display_frames) == 1:
-                        combined = display_frames[0]
-                    else:
-                        combined = np.hstack(display_frames[:min(3, len(display_frames))])
+                # Process frames if we have any
+                valid_frames = [f for f in frames if f is not None]
+                if valid_frames:
+                    display_frames = []
+                    for i, frame in enumerate(frames):
+                        if frame is not None:
+                            processed_frame = frame.copy()
+                            
+                            # Add to buffer
+                            self.frame_buffers[i].append(processed_frame.copy())
+                            
+                            # If recording, write to file
+                            if self.is_recording and not self.stop_recording_flag:
+                                if i < len(self.video_writers) and self.video_writers[i] is not None:
+                                    # Add timestamp to recorded frame
+                                    timestamp_text = f"c922-{i} - {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
+                                    recorded_frame = add_timestamp_to_frame(processed_frame.copy(), timestamp_text)
+                                    self.video_writers[i].write(recorded_frame)
+                            
+                            # Only create display frames when NOT recording
+                            if not self.is_recording:
+                                # Create display frame (smaller)
+                                display_frame = cv2.resize(processed_frame, (320, 240))
+                                
+                                cv2.putText(display_frame, f"c922-{i}", (10, 20), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                
+                                display_frames.append(display_frame)
                     
-                    # Add status info
-                    status = "RECORDING" if self.is_recording else "READY"
-                    color = (0, 0, 255) if self.is_recording else (0, 255, 0)
-                    cv2.putText(combined, status, (10, combined.shape[0] - 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                    
-                    if not self.is_recording:
-                       cv2.imshow('Golf Swing Recorder', combined)
-                    else:
-                       cv2.destroyWindow('Golf Swing Recorder')
+                    # Show GUI only when NOT recording and we have enough frames
+                    if not self.is_recording and display_frames and len(valid_frames) >= len(self.cameras):
+                        if len(display_frames) == 1:
+                            combined = display_frames[0]
+                        else:
+                            combined = np.hstack(display_frames[:min(3, len(display_frames))])
+                        
+                        # Add status info
+                        cv2.putText(combined, "READY", (10, combined.shape[0] - 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        cv2.imshow('Golf Swing Recorder', combined)
+                        self.window_visible = True
                 
                 # Process voice commands
                 try:
@@ -379,13 +501,26 @@ class VoiceControlledRecorder:
                     self.listening = not self.listening
                     print(f"Voice control: {'ON' if self.listening else 'OFF'}")
                 
-                # Update FPS counter
+                # Update FPS counter every 15 seconds
                 frame_count += 1
-                if frame_count % 30 == 0:
-                    elapsed = time.time() - fps_start
-                    fps = 30 / elapsed
-                    print(f"Processing FPS: {fps:.1f}")
-                    fps_start = time.time()
+                current_time = time.time()
+                if current_time - last_fps_log >= fps_log_interval:
+                    elapsed = current_time - fps_start
+                    if elapsed > 0:
+                        fps = frame_count / elapsed
+                        status_msg = "RECORDING" if self.is_recording else "READY"
+                        print(f"Processing FPS: {fps:.1f} - Status: {status_msg}")
+                    
+                    # Reset counters
+                    frame_count = 0
+                    fps_start = current_time
+                    last_fps_log = current_time
+                
+                # FIXED: Rate limiting for main loop
+                elapsed_time = time.time() - loop_start_time
+                sleep_time = self.frame_interval - elapsed_time
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
                     
         except KeyboardInterrupt:
             print("\nInterrupted by user")
@@ -414,11 +549,15 @@ class VoiceControlledRecorder:
         
         # Release cameras and close windows
         cv2.destroyAllWindows()
+        self.window_visible = False
         release_cameras(self.cameras)
 
 def main():
     """Main function"""
     print("=== Golf Swing Voice Recorder ===")
+    print("This version automatically filters to c922 cameras only")
+    print("(Internal webcams will be excluded)")
+    print()
     
     # Ask user about calibration
     use_cal = input("Use camera calibration? (y/n, default=y): ").lower()
@@ -426,6 +565,7 @@ def main():
     
     # Create and run recorder
     recorder = VoiceControlledRecorder(use_calibration=use_calibration)
+    recorder.run()
     recorder.run()
 
 if __name__ == "__main__":
